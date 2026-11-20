@@ -437,6 +437,18 @@ begin
     end if;
     if not exists (
       select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'conversations'
+    ) then
+      alter publication supabase_realtime add table public.conversations;
+    end if;
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'conversation_members'
+    ) then
+      alter publication supabase_realtime add table public.conversation_members;
+    end if;
+    if not exists (
+      select 1 from pg_publication_tables
       where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'stories'
     ) then
       alter publication supabase_realtime add table public.stories;

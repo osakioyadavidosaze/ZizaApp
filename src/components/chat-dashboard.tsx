@@ -288,6 +288,29 @@ export function ChatDashboard() {
   }, [loadDashboard]);
 
   useEffect(() => {
+    if (!supabase || !currentUserId) return;
+
+    const reloadDashboard = () => {
+      void loadDashboardRef.current();
+    };
+    const channel = supabase
+      .channel(`ziza:account:${currentUserId}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "conversations" }, reloadDashboard)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: `user_id=eq.${currentUserId}` }, reloadDashboard)
+      .on("postgres_changes", { event: "*", schema: "public", table: "contacts", filter: `user_id=eq.${currentUserId}` }, reloadDashboard)
+      .on("postgres_changes", { event: "*", schema: "public", table: "contacts", filter: `contact_id=eq.${currentUserId}` }, reloadDashboard)
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setError("Live chat updates are unavailable. Check your Supabase Realtime configuration.");
+        }
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [currentUserId, supabase]);
+
+  useEffect(() => {
     if (!activeId || !currentUserId || currentUserHidesOnline === undefined || !supabase) {
       setMessages([]);
       return;
@@ -302,6 +325,9 @@ export function ChatDashboard() {
         void loadDashboardRef.current();
         if (isChatVisible()) void markConversationRead(activeId);
       })
+      .on("postgres_changes", { event: "*", schema: "public", table: "conversations", filter: `id=eq.${activeId}` }, () => {
+        void loadDashboardRef.current();
+      })
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         const senderId = typeof payload?.user_id === "string" ? payload.user_id : "";
         if (senderId !== currentUserId) setTyping(Boolean(payload?.is_typing));
@@ -313,6 +339,8 @@ export function ChatDashboard() {
       .subscribe((status) => {
         if (status === "SUBSCRIBED" && !currentUserHidesOnline) {
           void channel.track({ user_id: currentUserId, online_at: new Date().toISOString() });
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setError("Live conversation updates are unavailable. Check your Supabase Realtime configuration.");
         }
       });
     channelRef.current = channel;

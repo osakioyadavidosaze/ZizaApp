@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Clock3, ImagePlus, LoaderCircle, Send, Sparkles } from "lucide-react";
 import { SubpageNav } from "@/components/subpage-nav";
@@ -20,50 +20,82 @@ export default function StoriesPage() {
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [error, setError] = useState("");
+  const mountedRef = useRef(false);
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const loadStories = useCallback(async () => {
     if (!supabase) {
-      setError("Configure Supabase in .env.local to use stories.");
-      setLoading(false);
+      throw new Error("Configure Supabase in .env.local to use stories.");
+    }
+    const { data: authData, error: authError } = await supabase.auth.getUser();
+    if (authError) throw authError;
+    if (!authData.user) {
+      if (mountedRef.current) router.replace("/");
       return;
     }
-    let cancelled = false;
-    void (async () => {
-      const { data: authData } = await supabase.auth.getUser();
-      if (!authData.user) {
-        router.replace("/");
-        return;
+
+    const { data: rows, error: storiesError } = await supabase
+      .from("stories")
+      .select("*")
+      .gt("expires_at", new Date().toISOString())
+      .order("created_at", { ascending: false });
+    if (storiesError) throw storiesError;
+
+    const ids = [...new Set((rows ?? []).map((story) => story.user_id))];
+    const profilesResult = ids.length
+      ? await supabase.from("profiles").select("*").in("id", ids)
+      : { data: [], error: null };
+    if (profilesResult.error) throw profilesResult.error;
+
+    const profileMap = new Map((profilesResult.data ?? []).map((profile) => [profile.id, profile]));
+    const storyViews = (await Promise.all((rows ?? []).map(async (story) => {
+      const person = profileMap.get(story.user_id);
+      if (!person) return null;
+      let signedUrl: string | null = null;
+      if (story.media_path) {
+        const { data, error: signedUrlError } = await supabase.storage.from("story-media").createSignedUrl(story.media_path, 15 * 60);
+        if (signedUrlError) throw signedUrlError;
+        signedUrl = data.signedUrl;
       }
+      return { ...story, person, signedUrl, remainingMs: Math.max(0, new Date(story.expires_at).getTime() - Date.now()) };
+    }))).filter((story): story is StoryView => story !== null);
+
+    if (mountedRef.current) {
       setUserId(authData.user.id);
-      const { data: rows, error: storiesError } = await supabase.from("stories").select("*").gt("expires_at", new Date().toISOString()).order("created_at", { ascending: false });
-      if (storiesError) {
-        if (!cancelled) { setError(storiesError.message); setLoading(false); }
-        return;
-      }
-      const ids = [...new Set((rows ?? []).map((story) => story.user_id))];
-      const profilesResult = ids.length ? await supabase.from("profiles").select("*").in("id", ids) : { data: [], error: null };
-      if (profilesResult.error) {
-        if (!cancelled) { setError(profilesResult.error.message); setLoading(false); }
-        return;
-      }
-      const profileMap = new Map((profilesResult.data ?? []).map((profile) => [profile.id, profile]));
-      const storyViews = (await Promise.all((rows ?? []).map(async (story) => {
-        const person = profileMap.get(story.user_id);
-        if (!person) return null;
-        let signedUrl: string | null = null;
-        if (story.media_path) {
-          const { data } = await supabase.storage.from("story-media").createSignedUrl(story.media_path, 15 * 60);
-          signedUrl = data?.signedUrl ?? null;
-        }
-        return { ...story, person, signedUrl, remainingMs: Math.max(0, new Date(story.expires_at).getTime() - Date.now()) };
-      }))).filter((story): story is StoryView => story !== null);
-      if (!cancelled) {
-        setStories(storyViews);
-        setLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
+      setStories(storyViews);
+      setLoading(false);
+    }
   }, [router, supabase]);
+
+  useEffect(() => {
+    const refresh = () => {
+      void loadStories().catch((caught: unknown) => {
+        if (mountedRef.current) {
+          setError(caught instanceof Error ? caught.message : "Could not load stories.");
+          setLoading(false);
+        }
+      });
+    };
+    refresh();
+
+    if (!supabase) return;
+    const channel = supabase
+      .channel("ziza:stories")
+      .on("postgres_changes", { event: "*", schema: "public", table: "stories" }, refresh)
+      .subscribe((status) => {
+        if ((status === "CHANNEL_ERROR" || status === "TIMED_OUT") && mountedRef.current) {
+          setError("Live story updates are unavailable. Check your Supabase Realtime configuration.");
+        }
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [loadStories, supabase]);
 
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const selected = event.target.files?.[0] ?? null;
@@ -113,7 +145,11 @@ export default function StoriesPage() {
     }
     setText("");
     setFile(null);
-    window.location.reload();
+    try {
+      await loadStories();
+    } catch (caught) {
+      setError(caught instanceof Error ? `Story posted, but the list could not refresh: ${caught.message}` : "Story posted, but the list could not refresh.");
+    }
   }
 
   const myStories = stories.filter((story) => story.user_id === userId);
