@@ -58,6 +58,7 @@ export function ChatDashboard() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [chats, setChats] = useState<ChatView[]>([]);
   const [pending, setPending] = useState<Array<{ contact: Contact; person: Profile }>>([]);
+  const [outgoing, setOutgoing] = useState<Array<{ contact: Contact; person: Profile }>>([]);
   const [activeId, setActiveId] = useState("");
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -197,6 +198,7 @@ export function ChatDashboard() {
     const relationships = [...(sentContactsResult.data ?? []), ...(receivedContactsResult.data ?? [])];
     const acceptedContacts = relationships.filter((contact) => contact.status === "accepted");
     const incoming = relationships.filter((contact) => contact.status === "pending" && contact.contact_id === userId);
+    const sentPending = relationships.filter((contact) => contact.status === "pending" && contact.user_id === userId);
     const memberRows = membershipsResult.data ?? [];
     const conversationIds = memberRows.map((member) => member.conversation_id);
     const blockedIds = new Set([
@@ -228,6 +230,7 @@ export function ChatDashboard() {
     }
     for (const contact of acceptedContacts) otherIds.add(contact.user_id === userId ? contact.contact_id : contact.user_id);
     for (const contact of incoming) otherIds.add(contact.user_id);
+    for (const contact of sentPending) otherIds.add(contact.contact_id);
 
     const profilesResult = otherIds.size
       ? await supabase.from("profiles").select("*").in("id", [...otherIds])
@@ -265,6 +268,11 @@ export function ChatDashboard() {
     const pendingRows = incoming.filter((contact) => !blockedIds.has(contact.user_id));
     setPending(pendingRows.flatMap((contact) => {
       const person = profilesById.get(contact.user_id);
+      return person ? [{ contact, person }] : [];
+    }));
+    const outgoingRows = sentPending.filter((contact) => !blockedIds.has(contact.contact_id));
+    setOutgoing(outgoingRows.flatMap((contact) => {
+      const person = profilesById.get(contact.contact_id);
       return person ? [{ contact, person }] : [];
     }));
 
@@ -639,15 +647,24 @@ export function ChatDashboard() {
             </>
           ) : (
             <>
-              <div className="list-label">CONTACT REQUESTS</div>
-              {pending.length ? pending.map(({ contact, person }) => (
+              <div className="list-label">INCOMING REQUESTS</div>
+              {pending.map(({ contact, person }) => (
                 <div className="request-row" key={contact.id}>
                   <Avatar name={person.display_name} url={person.avatar_url} />
                   <div className="request-copy"><strong>{person.display_name}</strong><span>@{person.username}</span></div>
-                  <button className="request-accept" title="Accept request" onClick={() => void respondToRequest(contact, true)}><Check size={15} /></button>
-                  <button className="request-decline" title="Decline request" onClick={() => void respondToRequest(contact, false)}><X size={15} /></button>
+                  <button className="request-accept" aria-label={`Accept ${person.display_name}'s request`} title="Accept request" onClick={() => void respondToRequest(contact, true)}><Check size={15} /></button>
+                  <button className="request-decline" aria-label={`Decline ${person.display_name}'s request`} title="Decline request" onClick={() => void respondToRequest(contact, false)}><X size={15} /></button>
                 </div>
-              )) : <div className="sidebar-empty">No new requests. Your contacts are always in your control.</div>}
+              ))}
+              <div className="list-label">SENT REQUESTS</div>
+              {outgoing.map(({ contact, person }) => (
+                <div className="request-row" key={contact.id}>
+                  <Avatar name={person.display_name} url={person.avatar_url} />
+                  <div className="request-copy"><strong>{person.display_name}</strong><span>@{person.username}</span></div>
+                  <span className="request-pending">Pending</span>
+                </div>
+              ))}
+              {!pending.length && !outgoing.length && <div className="sidebar-empty">No new requests. Your contacts are always in your control.</div>}
             </>
           )}
         </div>
@@ -739,7 +756,7 @@ export function ChatDashboard() {
         )}
       </section>
 
-      {searchOpen && profile && <ContactSearchDialog onClose={() => setSearchOpen(false)} onContact={async (person) => { setSearchOpen(false); await openContact(person.id); }} />}
+      {searchOpen && profile && <ContactSearchDialog onClose={() => setSearchOpen(false)} onContact={async (person) => { setSearchOpen(false); await openContact(person.id); }} onRequestSent={async () => { await loadDashboard(false); }} />}
     </main>
   );
 }

@@ -11,13 +11,15 @@ import { Avatar } from "@/components/ui/avatar";
 type ContactSearchDialogProps = {
   onClose: () => void;
   onContact: (person: Profile) => Promise<void>;
+  onRequestSent: () => Promise<void>;
 };
 
-export function ContactSearchDialog({ onClose, onContact }: ContactSearchDialogProps) {
+export function ContactSearchDialog({ onClose, onContact, onRequestSent }: ContactSearchDialogProps) {
   const supabase = getSupabaseBrowserClient();
   const [number, setNumber] = useState("");
   const [person, setPerson] = useState<Profile | null>(null);
   const [status, setStatus] = useState("");
+  const [requestSent, setRequestSent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [cameraError, setCameraError] = useState("");
@@ -30,6 +32,7 @@ export function ContactSearchDialog({ onClose, onContact }: ContactSearchDialogP
     event.preventDefault();
     setPerson(null);
     setStatus("");
+    setRequestSent(false);
     setCameraError("");
     const zizaNumber = normalizeZizaNumber(number);
     if (!zizaNumber) {
@@ -66,21 +69,57 @@ export function ContactSearchDialog({ onClose, onContact }: ContactSearchDialogP
   async function addPerson() {
     if (!supabase || !person) return;
     setBusy(true);
-    setStatus("");
+    setRequestSent(true);
+    setStatus("Sending request…");
     const { error } = await supabase.rpc("send_contact_request", { p_ziza_number: person.ziza_number });
-    setBusy(false);
     if (!error) {
       setStatus("Request sent. You can start chatting when they accept.");
+      setBusy(false);
+      await onRequestSent();
       return;
     }
 
     if (error.message.toLowerCase().includes("already exists")) {
-      const { data: conversationId, error: conversationError } = await supabase.rpc("create_direct_conversation", { p_contact_id: person.id });
-      if (!conversationError && conversationId) {
-        await onContact(person);
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user) {
+        setRequestSent(false);
+        setBusy(false);
+        setStatus(authError?.message ?? "Authentication is required to send a request.");
         return;
       }
+      const { data: relationship, error: relationshipError } = await supabase
+        .from("contacts")
+        .select("*")
+        .or(`and(user_id.eq.${authData.user.id},contact_id.eq.${person.id}),and(user_id.eq.${person.id},contact_id.eq.${authData.user.id})`)
+        .maybeSingle();
+      if (relationshipError) {
+        setRequestSent(false);
+        setBusy(false);
+        setStatus(relationshipError.message);
+        return;
+      }
+      if (relationship?.status === "pending") {
+        setStatus("This request is already pending.");
+        setBusy(false);
+        await onRequestSent();
+        return;
+      }
+      if (relationship?.status === "accepted") {
+        const { data: conversationId, error: conversationError } = await supabase.rpc("create_direct_conversation", { p_contact_id: person.id });
+        if (!conversationError && conversationId) {
+          await onContact(person);
+          return;
+        }
+        if (conversationError) {
+          setRequestSent(false);
+          setBusy(false);
+          setStatus(conversationError.message);
+          return;
+        }
+      }
     }
+    setRequestSent(false);
+    setBusy(false);
     setStatus(error.message);
   }
 
@@ -133,7 +172,7 @@ export function ContactSearchDialog({ onClose, onContact }: ContactSearchDialogP
         </div>
         <form onSubmit={(event) => void search(event)}>
           <div className="modal-form-row">
-            <input autoFocus inputMode="numeric" autoComplete="off" maxLength={12} placeholder="000-000-0000" value={number} onChange={(event) => { setNumber(event.target.value); setPerson(null); setStatus(""); }} />
+            <input autoFocus inputMode="numeric" autoComplete="off" maxLength={12} placeholder="000-000-0000" value={number} onChange={(event) => { setNumber(event.target.value); setPerson(null); setStatus(""); setRequestSent(false); }} />
             <button type="submit" className="primary-button" disabled={busy || !normalizeZizaNumber(number)}>{busy ? <LoaderCircle size={15} className="spin-icon" /> : <Search size={15} />} Search</button>
           </div>
         </form>
@@ -144,10 +183,10 @@ export function ContactSearchDialog({ onClose, onContact }: ContactSearchDialogP
           <div className="lookup-result">
             <Avatar name={person.display_name} url={person.avatar_url} />
             <div className="lookup-result-main"><strong>{person.display_name}</strong><span>@{person.username} · {formatZizaNumber(person.ziza_number)}</span></div>
-            <button className="primary-button request-button" onClick={() => void addPerson()} disabled={busy || Boolean(status.startsWith("Request sent"))}>{status.startsWith("Request sent") ? <Check size={14} /> : <UserPlus size={14} />}{status.startsWith("Request sent") ? "Sent" : "Add"}</button>
+            <button className="primary-button request-button" onClick={() => void addPerson()} disabled={busy || requestSent}>{requestSent ? <Check size={14} /> : <UserPlus size={14} />}{requestSent ? "Requested" : "Add"}</button>
           </div>
         )}
-        {status && <p className={`modal-error ${status.startsWith("Request sent") ? "modal-success" : ""}`} role="status">{status}</p>}
+        {status && <p className={`modal-error ${requestSent ? "modal-success" : ""}`} role="status">{status}</p>}
       </section>
     </div>
   );
