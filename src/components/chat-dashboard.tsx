@@ -14,16 +14,22 @@ import type { Contact, Conversation, Message, Profile, Streak } from "@/lib/data
 import { ContactSearchDialog } from "@/components/contact-search-dialog";
 import { Avatar } from "@/components/ui/avatar";
 
+type ChatMessage = Message & {
+  tempId?: string;
+  status?: "sending" | "sent" | "failed";
+};
+
 type ChatView = {
   conversation: Conversation;
   person: Profile;
-  lastMessage: Message | null;
+  lastMessage: ChatMessage | null;
   streak: Streak | null;
   unread: number;
   lastReadAt: string;
 };
 
 type MessageView = Message & {
+  tempId?: string;
   mediaUrl: string | null;
   reactions: Array<{ emoji: string; user_id: string }>;
   read: boolean;
@@ -40,8 +46,6 @@ function isMessage(value: unknown): value is Message {
   if (typeof value !== "object" || value === null) return false;
   return "id" in value
     && typeof value.id === "string"
-    && "client_id" in value
-    && (value.client_id === null || typeof value.client_id === "string")
     && "conversation_id" in value
     && typeof value.conversation_id === "string"
     && "sender_id" in value
@@ -85,25 +89,48 @@ function sortMessages(messages: MessageView[]) {
   return messages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 }
 
-function upsertMessageList(messages: MessageView[], incoming: MessageView) {
-  const index = messages.findIndex((message) =>
-    message.id === incoming.id
-    || (incoming.client_id !== null && message.client_id === incoming.client_id),
-  );
-  const next = [...messages];
-  if (index === -1) {
-    next.push(incoming);
-  } else {
-    const existing = next[index];
-    next[index] = {
-      ...existing,
-      ...incoming,
-      mediaUrl: incoming.mediaUrl ?? existing.mediaUrl,
-      reactions: incoming.reactions.length ? incoming.reactions : existing.reactions,
-      read: incoming.read || existing.read,
-      status: incoming.status ?? existing.status,
-    };
+function matchesPendingMessage(pending: MessageView, message: Message) {
+  return (pending.status === "sending" || pending.status === "failed")
+    && pending.id !== message.id
+    && pending.sender_id === message.sender_id
+    && pending.conversation_id === message.conversation_id
+    && pending.reply_to_id === message.reply_to_id
+    && pending.type === message.type
+    && pending.body === message.body
+    && pending.media_path === message.media_path
+    && Math.abs(new Date(pending.created_at).getTime() - new Date(message.created_at).getTime()) < 2 * 60 * 1000;
+}
+
+function findPendingMessage(messages: MessageView[], message: Message) {
+  let match: MessageView | undefined;
+  let smallestTimeDelta = Infinity;
+  for (const candidate of messages) {
+    if (!matchesPendingMessage(candidate, message)) continue;
+    const timeDelta = Math.abs(new Date(candidate.created_at).getTime() - new Date(message.created_at).getTime());
+    if (timeDelta < smallestTimeDelta) {
+      match = candidate;
+      smallestTimeDelta = timeDelta;
+    }
   }
+  return match;
+}
+
+function upsertMessageList(messages: MessageView[], incoming: MessageView) {
+  const existing = (incoming.tempId
+    ? messages.find((message) => message.tempId === incoming.tempId)
+    : undefined) ?? messages.find((message) => message.id === incoming.id);
+  const merged = existing ? {
+    ...existing,
+    ...incoming,
+    mediaUrl: incoming.mediaUrl ?? existing.mediaUrl,
+    reactions: incoming.reactions.length ? incoming.reactions : existing.reactions,
+    read: incoming.read || existing.read,
+    status: incoming.status ?? existing.status,
+  } : incoming;
+  const next = messages.filter((message) =>
+    message.id !== incoming.id && (!incoming.tempId || message.tempId !== incoming.tempId),
+  );
+  next.push(merged);
   return sortMessages(next);
 }
 
@@ -145,6 +172,7 @@ export function ChatDashboard() {
   const mobileChatOpenRef = useRef(mobileChatOpen);
   const messagesCacheRef = useRef(new Map<string, MessageView[]>());
   const pendingSendsRef = useRef(new Set<string>());
+  const sendSubmitLockRef = useRef(false);
 
   const selectConversation = useCallback((conversationId: string) => {
     activeIdRef.current = conversationId;
@@ -162,22 +190,26 @@ export function ChatDashboard() {
     return chats.filter((chat) => !query || chat.person.display_name.toLowerCase().includes(query) || chat.person.username.toLowerCase().includes(query));
   }, [chats, filter]);
 
-  const updateConversationPreview = useCallback((message: Message) => {
+  const updateConversationPreview = useCallback((message: ChatMessage) => {
     setChats((current) => {
       let foundConversation = false;
       const updated = current.map((chat) => {
         if (chat.conversation.id !== message.conversation_id) return chat;
         foundConversation = true;
         const previous = chat.lastMessage;
+        const pending = message.tempId
+          ? undefined
+          : findPendingMessage(messagesCacheRef.current.get(message.conversation_id) ?? [], message);
         const isDuplicate = previous?.id === message.id
-          || (message.client_id !== null && previous?.client_id === message.client_id);
+          || Boolean(message.tempId && previous?.tempId === message.tempId)
+          || Boolean(pending);
         if (previous && !isDuplicate && new Date(previous.created_at) > new Date(message.created_at)) return chat;
         const isVisibleActiveChat = activeIdRef.current === message.conversation_id
           && document.visibilityState === "visible"
-          && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpenRef.current);
+          && (!window.matchMedia("(max-width: 767px)").matches || mobileChatOpenRef.current);
         return {
           ...chat,
-          lastMessage: message,
+          lastMessage: pending ? { ...message, tempId: pending.tempId, status: "sent" as const } : message,
           unread: !isDuplicate && message.sender_id !== currentUserId && !isVisibleActiveChat
             ? chat.unread + 1
             : chat.unread,
@@ -284,7 +316,7 @@ export function ChatDashboard() {
 
   const isChatVisible = useCallback(() => (
     document.visibilityState === "visible"
-    && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpenRef.current)
+    && (!window.matchMedia("(max-width: 767px)").matches || mobileChatOpenRef.current)
   ), []);
 
   const markConversationRead = useCallback(async (conversationId: string) => {
@@ -462,11 +494,20 @@ export function ChatDashboard() {
         return;
       }
       const message = row;
-      upsertMessage({ ...message, mediaUrl: null, reactions: [], read: false, status: "sent" });
-      updateConversationPreview(message);
+      const pending = findPendingMessage(messagesCacheRef.current.get(message.conversation_id) ?? [], message);
+      const confirmed: MessageView = {
+        ...message,
+        ...(pending ? { tempId: pending.tempId } : {}),
+        mediaUrl: null,
+        reactions: [],
+        read: false,
+        status: "sent",
+      };
+      upsertMessage(confirmed);
+      updateConversationPreview(confirmed);
       if (message.sender_id !== currentUserId && activeIdRef.current === message.conversation_id
         && document.visibilityState === "visible"
-        && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpenRef.current)) {
+        && (!window.matchMedia("(max-width: 767px)").matches || mobileChatOpenRef.current)) {
         void markConversationRead(message.conversation_id);
       }
     };
@@ -596,12 +637,12 @@ export function ChatDashboard() {
   }
 
   async function persistMessage(message: MessageView) {
-    if (!supabase || !message.client_id || pendingSendsRef.current.has(message.client_id)) return;
-    pendingSendsRef.current.add(message.client_id);
+    if (!supabase || !message.tempId || pendingSendsRef.current.has(message.tempId)) return;
+    const { tempId } = message;
+    pendingSendsRef.current.add(tempId);
     upsertMessage({ ...message, status: "sending" });
     try {
       const { data, error: insertError } = await supabase.from("messages").insert({
-        client_id: message.client_id,
         conversation_id: message.conversation_id,
         sender_id: message.sender_id,
         reply_to_id: message.reply_to_id,
@@ -609,33 +650,19 @@ export function ChatDashboard() {
         body: message.body,
         media_path: message.media_path,
       }).select("*").single();
-      let savedMessage = data;
       if (insertError) {
-        const { data: existingMessage, error: lookupError } = await supabase
-          .from("messages")
-          .select("*")
-          .eq("sender_id", message.sender_id)
-          .eq("client_id", message.client_id)
-          .maybeSingle();
-        if (lookupError) {
-          upsertMessage({ ...message, status: "failed" });
-          setError(`${insertError.message} Also, checking whether the message was saved failed: ${lookupError.message}`);
-          return;
-        }
-        if (!existingMessage) {
-          upsertMessage({ ...message, status: "failed" });
-          setError(insertError.message);
-          return;
-        }
-        savedMessage = existingMessage;
+        upsertMessage({ ...message, status: "failed" });
+        setError(insertError.message);
+        return;
       }
-      if (!savedMessage) {
+      if (!data) {
         upsertMessage({ ...message, status: "failed" });
         setError("The message insert returned no row.");
         return;
       }
       const confirmed: MessageView = {
-        ...savedMessage,
+        ...data,
+        tempId,
         mediaUrl: null,
         reactions: [],
         read: false,
@@ -661,19 +688,23 @@ export function ChatDashboard() {
       upsertMessage({ ...message, status: "failed" });
       setError(caught instanceof Error ? caught.message : "Could not send the message.");
     } finally {
-      pendingSendsRef.current.delete(message.client_id);
+      pendingSendsRef.current.delete(tempId);
     }
   }
 
   async function sendMessage(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
-    if (!supabase || !profile || !activeChat || !draft.trim()) return;
+    if (sendSubmitLockRef.current || !supabase || !profile || !activeChat || !draft.trim()) return;
+    sendSubmitLockRef.current = true;
+    window.setTimeout(() => {
+      sendSubmitLockRef.current = false;
+    }, 0);
     const body = draft.trim();
     const replyToId = reply?.id ?? null;
-    const clientId = crypto.randomUUID();
+    const tempId = crypto.randomUUID();
     const optimistic: MessageView = {
-      id: clientId,
-      client_id: clientId,
+      id: tempId,
+      tempId,
       conversation_id: activeChat.conversation.id,
       sender_id: profile.id,
       reply_to_id: replyToId,
@@ -714,10 +745,10 @@ export function ChatDashboard() {
       setError(uploadError.message);
       return;
     }
-    const clientId = crypto.randomUUID();
+    const tempId = crypto.randomUUID();
     const optimistic: MessageView = {
-      id: clientId,
-      client_id: clientId,
+      id: tempId,
+      tempId,
       conversation_id: activeChat.conversation.id,
       sender_id: profile.id,
       reply_to_id: null,
@@ -808,10 +839,9 @@ export function ChatDashboard() {
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      void sendMessage();
-    }
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    void sendMessage();
   }
 
   async function toggleReaction(message: MessageView, emoji: string) {
@@ -994,7 +1024,7 @@ export function ChatDashboard() {
                 const previous = messages[index - 1];
                 const showDate = !previous || new Date(previous.created_at).toDateString() !== new Date(message.created_at).toDateString();
                 return (
-                  <div key={message.client_id ? `${message.sender_id}:${message.client_id}` : message.id} className={`message-line ${isOwn ? "own" : "other"}`}>
+                  <div key={message.tempId ?? message.id} className={`message-line ${isOwn ? "own" : "other"}`}>
                     {!isOwn && <Avatar name={activeChat.person.display_name} url={activeChat.person.avatar_url} />}
                     <div className="message-content">
                       {showDate && <div className="feed-date">{new Date(message.created_at).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })}</div>}
@@ -1036,7 +1066,7 @@ export function ChatDashboard() {
                   <button className="composer-tool" type="button" title="Attach image or file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button>
                   <input ref={fileInputRef} hidden type="file" accept="image/*,.pdf,.txt,.docx" onChange={(event) => void handleFileChange(event)} />
                 </div>
-                <textarea value={draft} onChange={(event) => updateTyping(event.target.value)} onKeyDown={handleComposerKeyDown} placeholder="Write a message..." rows={1} aria-label="Message" />
+                <textarea value={draft} onChange={(event) => updateTyping(event.target.value)} onKeyDown={handleComposerKeyDown} enterKeyHint="send" placeholder="Write a message..." rows={1} aria-label="Message" />
                 {draft.trim() ? <button className="send-button" type="submit" title="Send message" disabled={sending}><Send size={16} /></button> : <button className={`composer-tool record-button ${recording ? "recording" : ""}`} type="button" title={recording ? `Stop recording (${recordSeconds}s)` : "Record voice note"} onClick={() => recording ? stopRecording() : void startRecording()}>{recording ? <Square size={15} /> : <Mic size={17} />}</button>}
               </form>
               {emojiOpen && <div className="emoji-popover"><div className="emoji-grid">{QUICK_EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => { setDraft((value) => value + emoji); setEmojiOpen(false); }}>{emoji}</button>)}</div></div>}

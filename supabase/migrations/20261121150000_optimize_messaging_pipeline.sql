@@ -1,10 +1,3 @@
-alter table public.messages
-  add column if not exists client_id uuid;
-
-create unique index if not exists messages_sender_client_id_unique_idx
-  on public.messages (sender_id, client_id)
-  where client_id is not null;
-
 create index if not exists messages_conversation_created_idx
   on public.messages (conversation_id, created_at desc);
 
