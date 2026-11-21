@@ -579,13 +579,13 @@ alter table public.message_receipts enable row level security;
 alter table public.streaks enable row level security;
 alter table public.stories enable row level security;
 
-create policy "Profiles are visible to self and accepted contacts"
+create policy "Profiles are visible to self and request participants"
   on public.profiles for select to authenticated
   using (
     id = (select auth.uid())
     or exists (
       select 1 from public.contacts c
-      where c.status = 'accepted'
+      where c.status in ('pending', 'accepted')
         and ((c.user_id = (select auth.uid()) and c.contact_id = profiles.id)
           or (c.contact_id = (select auth.uid()) and c.user_id = profiles.id))
     )

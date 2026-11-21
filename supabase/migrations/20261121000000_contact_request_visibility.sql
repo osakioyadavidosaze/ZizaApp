@@ -1,4 +1,6 @@
 drop policy if exists "Profiles are visible to self and accepted contacts" on public.profiles;
+drop policy if exists "Profiles are visible to self and request participants" on public.profiles;
+drop policy if exists "Profiles are visible to self and contact request participants" on public.profiles;
 create policy "Profiles are visible to self and contact request participants"
   on public.profiles for select to authenticated
   using (
