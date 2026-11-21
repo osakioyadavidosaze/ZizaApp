@@ -54,6 +54,22 @@ Supabase Auth does not provide a native username/password provider. This app use
 
 Media is uploaded to private Storage buckets and accessed using short-lived signed URLs. The UI can hide expired messages, stories, and streaks, but scheduled physical cleanup still needs to be configured.
 
+## PWA and Android app
+
+The App Router manifest at `/manifest.webmanifest` and the icons in `public/icons/` enable browser installation over HTTPS. The app uses standalone display mode and mobile safe-area insets; offline use is not configured.
+
+The Capacitor Android project uses `https://zizaapp.vercel.app` as its WebView URL, so the native app requires a network connection and picks up deployed web updates without a new APK. Capacitor documents `server.url` as intended for live reload rather than production packaging. For a store release, review the [Capacitor production workflow](https://capacitorjs.com/docs/basics/workflow) and package the web assets instead of relying on the remote URL.
+
+To sync the native project and open it in Android Studio (with the Android SDK installed):
+
+```powershell
+npm run build
+npx cap sync android
+npx cap open android
+```
+
+After changing the Capacitor config or adding native plugins, run `npx cap sync android` again.
+
 ## Product blueprint
 
 ### Routes and user flows

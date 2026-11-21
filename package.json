@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
     "@supabase/ssr": "latest",
     "@supabase/supabase-js": "latest",
     "@zxing/browser": "latest",
@@ -21,6 +23,7 @@
     "zod": "latest"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.6.2",
     "@tailwindcss/postcss": "latest",
     "@types/node": "latest",
     "@types/react": "latest",
