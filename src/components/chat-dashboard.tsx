@@ -4,15 +4,16 @@ import { ChangeEvent, FormEvent, KeyboardEvent, useCallback, useEffect, useMemo,
 import { useRouter } from "next/navigation";
 import {
   ArrowDown, ArrowLeft, ArrowRight, Check, CheckCheck, Clock3, FileText, Flame,
-  LockKeyhole, LogOut, MessageCircle, MoreHorizontal, Paperclip, Plus,
+  ChevronLeft, ChevronRight, LockKeyhole, LogOut, MessageCircle, MoreHorizontal, Paperclip, Pause, Play, Plus,
   Search, Send, Settings2, ShieldBan, Smile, Sparkles, Sticker, X, Mic, Square, Copy,
 } from "lucide-react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { formatZizaNumber } from "@/lib/auth";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import type { Contact, Conversation, Message, Profile, Streak } from "@/lib/database.types";
+import type { Contact, Conversation, Message, Profile, Streak, Story } from "@/lib/database.types";
 import { ContactSearchDialog } from "@/components/contact-search-dialog";
 import { Avatar } from "@/components/ui/avatar";
+import { compressImage } from "@/lib/compress-image";
 
 type ChatMessage = Message & {
   tempId?: string;
@@ -36,6 +37,8 @@ type MessageView = Message & {
   status?: "sending" | "sent" | "failed";
 };
 
+type ChatStory = Story & { person: Profile; signedUrl: string | null };
+
 const QUICK_EMOJIS = ["😀", "😂", "🥹", "😍", "🔥", "💜", "👏", "✨", "👍", "❤️", "🎉", "🙏"];
 
 function initials(name: string) {
@@ -58,6 +61,8 @@ function isMessage(value: unknown): value is Message {
     && (value.body === null || typeof value.body === "string")
     && "media_path" in value
     && (value.media_path === null || typeof value.media_path === "string")
+    && "duration_seconds" in value
+    && (value.duration_seconds === null || typeof value.duration_seconds === "number")
     && "created_at" in value
     && typeof value.created_at === "string"
     && "edited_at" in value
@@ -73,6 +78,11 @@ function timeLabel(value: string) {
   const now = new Date();
   if (date.toDateString() === now.toDateString()) return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function formatDuration(seconds: number) {
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 function streakState(streak: Streak | null) {
@@ -139,6 +149,8 @@ export function ChatDashboard() {
   const supabase = getSupabaseBrowserClient();
   const [profile, setProfile] = useState<Profile | null>(null);
   const [chats, setChats] = useState<ChatView[]>([]);
+  const [stories, setStories] = useState<ChatStory[]>([]);
+  const [viewingStoryIndex, setViewingStoryIndex] = useState<number | null>(null);
   const [pending, setPending] = useState<Array<{ contact: Contact; person: Profile }>>([]);
   const [outgoing, setOutgoing] = useState<Array<{ contact: Contact; person: Profile }>>([]);
   const [activeId, setActiveId] = useState("");
@@ -160,14 +172,23 @@ export function ChatDashboard() {
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
+  const [voiceDraft, setVoiceDraft] = useState<File | null>(null);
+  const [voiceDraftUrl, setVoiceDraftUrl] = useState<string | null>(null);
+  const [publishingStory, setPublishingStory] = useState(false);
   const channelRef = useRef<RealtimeChannel | null>(null);
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunks = useRef<Blob[]>([]);
+  const voiceFilesRef = useRef(new Map<string, File>());
+  const uploadedVoicePathsRef = useRef(new Set<string>());
+  const voiceObjectUrlsRef = useRef(new Map<string, string>());
+  const voiceDraftUrlRef = useRef<string | null>(null);
+  const discardRecordingRef = useRef(false);
   const recordTimer = useRef<number | null>(null);
   const feedRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const storyInputRef = useRef<HTMLInputElement>(null);
   const activeIdRef = useRef(activeId);
   const mobileChatOpenRef = useRef(mobileChatOpen);
   const messagesCacheRef = useRef(new Map<string, MessageView[]>());
@@ -189,6 +210,18 @@ export function ChatDashboard() {
     const query = filter.trim().toLowerCase();
     return chats.filter((chat) => !query || chat.person.display_name.toLowerCase().includes(query) || chat.person.username.toLowerCase().includes(query));
   }, [chats, filter]);
+  const storyGroups = useMemo(() => {
+    const groups = new Map<string, ChatStory[]>();
+    for (const story of stories) {
+      const group = groups.get(story.user_id) ?? [];
+      group.push(story);
+      groups.set(story.user_id, group);
+    }
+    return [...groups.entries()]
+      .map(([userId, items]) => ({ userId, items, person: items[0].person }))
+      .sort((a, b) => new Date(b.items[b.items.length - 1].created_at).getTime() - new Date(a.items[a.items.length - 1].created_at).getTime());
+  }, [stories]);
+  const viewingStory = viewingStoryIndex === null ? null : stories[viewingStoryIndex] ?? null;
 
   const updateConversationPreview = useCallback((message: ChatMessage) => {
     setChats((current) => {
@@ -220,6 +253,14 @@ export function ChatDashboard() {
     });
   }, [currentUserId]);
 
+  useEffect(() => {
+    if (viewingStoryIndex === null || !viewingStory) return;
+    const timer = window.setTimeout(() => {
+      setViewingStoryIndex((current) => current === null ? null : current + 1 < stories.length ? current + 1 : null);
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [stories.length, viewingStory, viewingStoryIndex]);
+
   const scheduleRealtimeReconnect = useCallback(() => {
     if (reconnectTimerRef.current !== null) return;
     reconnectTimerRef.current = window.setTimeout(() => {
@@ -230,6 +271,11 @@ export function ChatDashboard() {
 
   useEffect(() => () => {
     if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    if (recordTimer.current !== null) window.clearInterval(recordTimer.current);
+    discardRecordingRef.current = true;
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    for (const url of voiceObjectUrlsRef.current.values()) URL.revokeObjectURL(url);
+    if (voiceDraftUrlRef.current) URL.revokeObjectURL(voiceDraftUrlRef.current);
   }, []);
 
   const upsertMessage = useCallback((message: MessageView) => {
@@ -354,6 +400,7 @@ export function ChatDashboard() {
       membershipsResult,
       ownBlocksResult,
       blockedByResult,
+      activeStoriesResult,
     ] = await Promise.all([
       supabase.from("profiles").select("*").eq("id", userId).single(),
       supabase.from("contacts").select("*").eq("user_id", userId),
@@ -361,9 +408,10 @@ export function ChatDashboard() {
       supabase.from("conversation_members").select("*").eq("user_id", userId),
       supabase.from("blocks").select("blocked_id").eq("blocker_id", userId),
       supabase.from("blocks").select("blocker_id").eq("blocked_id", userId),
+      supabase.from("stories").select("*").gt("expires_at", new Date().toISOString()).order("created_at", { ascending: false }).limit(100),
     ]);
 
-    const firstError = ownProfileResult.error ?? sentContactsResult.error ?? receivedContactsResult.error ?? membershipsResult.error ?? ownBlocksResult.error ?? blockedByResult.error;
+    const firstError = ownProfileResult.error ?? sentContactsResult.error ?? receivedContactsResult.error ?? membershipsResult.error ?? ownBlocksResult.error ?? blockedByResult.error ?? activeStoriesResult.error;
     if (firstError) {
       setError(firstError.message);
       setLoading(false);
@@ -408,6 +456,7 @@ export function ChatDashboard() {
     for (const contact of acceptedContacts) otherIds.add(contact.user_id === userId ? contact.contact_id : contact.user_id);
     for (const contact of incoming) otherIds.add(contact.user_id);
     for (const contact of sentPending) otherIds.add(contact.contact_id);
+    for (const story of activeStoriesResult.data ?? []) otherIds.add(story.user_id);
 
     const profilesResult = otherIds.size
       ? await supabase.from("profiles").select("*").in("id", [...otherIds])
@@ -418,6 +467,18 @@ export function ChatDashboard() {
       return;
     }
     const profilesById = new Map((profilesResult.data ?? []).map((person) => [person.id, person]));
+    const storyViews = await Promise.all((activeStoriesResult.data ?? []).map(async (story): Promise<ChatStory | null> => {
+      const person = profilesById.get(story.user_id);
+      if (!person) return null;
+      let signedUrl: string | null = null;
+      if (story.media_path) {
+        const { data, error: signedUrlError } = await supabase.storage.from("story-media").createSignedUrl(story.media_path, 15 * 60);
+        if (signedUrlError) setError(`Could not load a story image: ${signedUrlError.message}`);
+        else signedUrl = data.signedUrl;
+      }
+      return { ...story, person, signedUrl };
+    }));
+    setStories(storyViews.filter((story): story is ChatStory => story !== null).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()));
     const streakByConversation = new Map((streakRows ?? []).map((streak) => [streak.conversation_id, streak]));
     const chatsLoaded: ChatView[] = (conversationRows ?? []).flatMap((conversation) => {
       const otherMember = allMembers.find((member) => member.conversation_id === conversation.id && member.user_id !== userId);
@@ -495,6 +556,7 @@ export function ChatDashboard() {
       }
       const message = row;
       const pending = findPendingMessage(messagesCacheRef.current.get(message.conversation_id) ?? [], message);
+      if (pending?.tempId) voiceFilesRef.current.delete(pending.tempId);
       const confirmed: MessageView = {
         ...message,
         ...(pending ? { tempId: pending.tempId } : {}),
@@ -517,6 +579,7 @@ export function ChatDashboard() {
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: `user_id=eq.${currentUserId}` }, reloadDashboard)
       .on("postgres_changes", { event: "*", schema: "public", table: "contacts", filter: `user_id=eq.${currentUserId}` }, reloadDashboard)
       .on("postgres_changes", { event: "*", schema: "public", table: "contacts", filter: `contact_id=eq.${currentUserId}` }, reloadDashboard)
+      .on("postgres_changes", { event: "*", schema: "public", table: "stories" }, reloadDashboard)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, ({ new: row }) => {
         applyRealtimeMessage(row);
       })
@@ -642,6 +705,18 @@ export function ChatDashboard() {
     pendingSendsRef.current.add(tempId);
     upsertMessage({ ...message, status: "sending" });
     try {
+      const voiceFile = voiceFilesRef.current.get(tempId);
+      if (voiceFile && message.media_path && !uploadedVoicePathsRef.current.has(message.media_path)) {
+        const { error: uploadError } = await supabase.storage
+          .from("chat-media")
+          .upload(message.media_path, voiceFile, { contentType: voiceFile.type, upsert: false });
+        if (uploadError) {
+          upsertMessage({ ...message, status: "failed" });
+          setError(uploadError.message);
+          return;
+        }
+        uploadedVoicePathsRef.current.add(message.media_path);
+      }
       const { data, error: insertError } = await supabase.from("messages").insert({
         conversation_id: message.conversation_id,
         sender_id: message.sender_id,
@@ -649,6 +724,7 @@ export function ChatDashboard() {
         type: message.type,
         body: message.body,
         media_path: message.media_path,
+        duration_seconds: message.duration_seconds,
       }).select("*").single();
       if (insertError) {
         upsertMessage({ ...message, status: "failed" });
@@ -670,6 +746,8 @@ export function ChatDashboard() {
       };
       upsertMessage(confirmed);
       updateConversationPreview(confirmed);
+      voiceFilesRef.current.delete(tempId);
+      if (confirmed.media_path) uploadedVoicePathsRef.current.delete(confirmed.media_path);
       if (confirmed.media_path) {
         try {
           const { data: signedUrl, error: signedUrlError } = await supabase.storage
@@ -679,6 +757,9 @@ export function ChatDashboard() {
             setError(signedUrlError.message);
           } else if (signedUrl) {
             upsertMessage({ ...confirmed, mediaUrl: signedUrl.signedUrl });
+            const objectUrl = voiceObjectUrlsRef.current.get(tempId);
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+            voiceObjectUrlsRef.current.delete(tempId);
           }
         } catch (caught) {
           setError(caught instanceof Error ? caught.message : "Could not load the attachment.");
@@ -711,6 +792,7 @@ export function ChatDashboard() {
       type: "text",
       body,
       media_path: null,
+      duration_seconds: null,
       created_at: new Date().toISOString(),
       edited_at: null,
       deleted_at: null,
@@ -755,6 +837,7 @@ export function ChatDashboard() {
       type,
       body: null,
       media_path: path,
+      duration_seconds: null,
       created_at: new Date().toISOString(),
       edited_at: null,
       deleted_at: null,
@@ -793,8 +876,9 @@ export function ChatDashboard() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const preferredType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find((type) => MediaRecorder.isTypeSupported(type));
+      const preferredType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((type) => MediaRecorder.isTypeSupported(type));
       const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined);
+      discardRecordingRef.current = false;
       recordingChunks.current = [];
       recorder.ondataavailable = (event) => {
         if (event.data.size) recordingChunks.current.push(event.data);
@@ -804,7 +888,15 @@ export function ChatDashboard() {
         stream.getTracks().forEach((track) => track.stop());
         if (recordTimer.current !== null) window.clearInterval(recordTimer.current);
         recordTimer.current = null;
-        if (blob.size) void sendFile(new File([blob], `voice-${Date.now()}.webm`, { type: blob.type }), "voice");
+        setRecording(false);
+        if (!discardRecordingRef.current && blob.size) {
+          const extension = blob.type.includes("mp4") ? "mp4" : blob.type.includes("ogg") ? "ogg" : "webm";
+          const file = new File([blob], `voice-${Date.now()}.${extension}`, { type: blob.type });
+          setVoiceDraft(file);
+          const objectUrl = URL.createObjectURL(blob);
+          voiceDraftUrlRef.current = objectUrl;
+          setVoiceDraftUrl(objectUrl);
+        }
       };
       recorderRef.current = recorder;
       recorder.start();
@@ -826,6 +918,58 @@ export function ChatDashboard() {
   function stopRecording() {
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     setRecording(false);
+  }
+
+  function cancelRecording() {
+    discardRecordingRef.current = true;
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    if (recordTimer.current !== null) window.clearInterval(recordTimer.current);
+    recordTimer.current = null;
+    setRecording(false);
+    setRecordSeconds(0);
+  }
+
+  function discardVoiceDraft() {
+    if (voiceDraftUrl) URL.revokeObjectURL(voiceDraftUrl);
+    voiceDraftUrlRef.current = null;
+    setVoiceDraft(null);
+    setVoiceDraftUrl(null);
+    setRecordSeconds(0);
+  }
+
+  function sendVoiceNote() {
+    if (!supabase || !profile || !activeChat || !voiceDraft || !voiceDraftUrl) return;
+    const tempId = crypto.randomUUID();
+    const mediaPath = `${activeChat.conversation.id}/${profile.id}/${tempId}-${voiceDraft.name}`;
+    const optimistic: MessageView = {
+      id: tempId,
+      tempId,
+      conversation_id: activeChat.conversation.id,
+      sender_id: profile.id,
+      reply_to_id: null,
+      type: "voice",
+      body: null,
+      media_path: mediaPath,
+      duration_seconds: Math.max(1, recordSeconds),
+      created_at: new Date().toISOString(),
+      edited_at: null,
+      deleted_at: null,
+      expires_at: null,
+      mediaUrl: voiceDraftUrl,
+      reactions: [],
+      read: false,
+      status: "sending",
+    };
+    voiceFilesRef.current.set(tempId, voiceDraft);
+    voiceObjectUrlsRef.current.set(tempId, voiceDraftUrl);
+    voiceDraftUrlRef.current = null;
+    setVoiceDraft(null);
+    setVoiceDraftUrl(null);
+    setRecordSeconds(0);
+    setError("");
+    upsertMessage(optimistic);
+    updateConversationPreview(optimistic);
+    void persistMessage(optimistic);
   }
 
   function updateTyping(value: string) {
@@ -898,6 +1042,68 @@ export function ChatDashboard() {
     window.setTimeout(() => setCopied(false), 1400);
   }
 
+  async function handleStoryImageChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Stories currently support image files only.");
+      return;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      setError("Choose an image smaller than 25 MB so it can be compressed for upload.");
+      return;
+    }
+    if (!supabase || !profile || publishingStory) return;
+
+    setPublishingStory(true);
+    setError("");
+    try {
+      const compressed = await compressImage(file);
+      if (compressed.size > 10 * 1024 * 1024) {
+        throw new Error("This image is still too large after compression. Choose a smaller image.");
+      }
+      const path = `${profile.id}/${crypto.randomUUID()}-${compressed.name.replace(/[^A-Za-z0-9._-]/g, "_").slice(-80)}`;
+      const { error: uploadError } = await supabase.storage
+        .from("story-media")
+        .upload(path, compressed, { contentType: compressed.type, upsert: false });
+      if (uploadError) throw uploadError;
+
+      const { data: story, error: insertError } = await supabase.from("stories").insert({
+        user_id: profile.id,
+        type: "image",
+        content: null,
+        media_path: path,
+      }).select("*").single();
+      if (insertError) throw insertError;
+
+      const { data: signed, error: signedError } = await supabase.storage.from("story-media").createSignedUrl(path, 15 * 60);
+      if (signedError) throw signedError;
+      setStories((current) => [...current.filter((item) => item.id !== story.id), {
+        ...story,
+        person: profile,
+        signedUrl: signed.signedUrl,
+      }].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not publish your story.");
+    } finally {
+      setPublishingStory(false);
+    }
+  }
+
+  function openStoryGroup(userId: string) {
+    const index = stories.findIndex((story) => story.user_id === userId);
+    if (index >= 0) setViewingStoryIndex(index);
+  }
+
+  function moveStory(direction: -1 | 1) {
+    setViewingStoryIndex((current) => {
+      if (current === null) return null;
+      const next = current + direction;
+      return next < 0 ? null : next >= stories.length ? null : next;
+    });
+  }
+
   return (
     <main className={`app-shell ${mobileChatOpen ? "mobile-chat-open" : ""}`}>
       <aside className="sidebar">
@@ -920,14 +1126,20 @@ export function ChatDashboard() {
         </div>
 
         <div className="story-strip">
-          <button className="story-chip" onClick={() => router.push("/stories")}>
-            <span className="story-ring mine"><Plus size={19} /><i className="story-add"><Plus size={10} /></i></span>
-            <span>Your story</span>
+          <button className="story-chip" onClick={() => storyInputRef.current?.click()} disabled={publishingStory}>
+            <span className={`story-ring mine ${storyGroups.some((group) => group.userId === profile?.id) ? "has-story" : ""}`}>
+              {storyGroups.find((group) => group.userId === profile?.id)
+                ? <Avatar name={profile?.display_name ?? "You"} url={profile?.avatar_url ?? null} />
+                : <Plus size={19} />}
+              <i className="story-add"><Plus size={10} /></i>
+            </span>
+            <span>{publishingStory ? "Uploading…" : "My Story (+)"}</span>
           </button>
-          {chats.slice(0, 7).map((chat) => (
-            <button key={chat.person.id} className="story-chip" title={`Stories from ${chat.person.display_name}`} onClick={() => router.push("/stories")}>
-              <span className="story-ring"><Avatar name={chat.person.display_name} url={chat.person.avatar_url} /></span>
-              <span>{chat.person.display_name.split(" ")[0]}</span>
+          <input ref={storyInputRef} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void handleStoryImageChange(event)} />
+          {storyGroups.filter((group) => group.userId !== profile?.id).map((group) => (
+            <button key={group.userId} className="story-chip" title={`Stories from ${group.person.display_name}`} onClick={() => openStoryGroup(group.userId)}>
+              <span className="story-ring"><Avatar name={group.person.display_name} url={group.person.avatar_url} /></span>
+              <span>{group.person.display_name.split(" ")[0]}</span>
             </button>
           ))}
         </div>
@@ -1038,7 +1250,7 @@ export function ChatDashboard() {
                         <>
                           <div className={`message-bubble ${message.deleted_at ? "deleted" : ""}`}>
                             {replyMessage && !message.deleted_at && <div className="reply-quote"><b>{replyMessage.sender_id === profile?.id ? "You" : activeChat.person.display_name}</b>{replyMessage.deleted_at ? "Message deleted" : replyMessage.body ?? "Attachment"}</div>}
-                            {message.deleted_at ? <p className="message-body">This message was deleted</p> : message.type === "image" && message.mediaUrl ? <a href={message.mediaUrl} target="_blank" rel="noreferrer"><img className="message-image" src={message.mediaUrl} alt="Shared image" /></a> : message.type === "voice" && message.mediaUrl ? <audio className="message-audio" controls src={message.mediaUrl} /> : message.type === "document" && message.mediaUrl ? <a className="message-file" href={message.mediaUrl} target="_blank" rel="noreferrer" download><FileText size={17} /> Download attachment <ArrowDown size={13} /></a> : <p className="message-body">{message.body}</p>}
+                            {message.deleted_at ? <p className="message-body">This message was deleted</p> : message.type === "image" && message.mediaUrl ? <a href={message.mediaUrl} target="_blank" rel="noreferrer"><img className="message-image" src={message.mediaUrl} alt="Shared image" /></a> : message.type === "voice" && message.mediaUrl ? <VoiceNotePlayer src={message.mediaUrl} duration={message.duration_seconds ?? 0} onError={setError} /> : message.type === "document" && message.mediaUrl ? <a className="message-file" href={message.mediaUrl} target="_blank" rel="noreferrer" download><FileText size={17} /> Download attachment <ArrowDown size={13} /></a> : <p className="message-body">{message.body}</p>}
                             <div className="message-meta">{message.edited_at && !message.deleted_at && <span className="edited-label">edited</span>}{isOwn && message.status === "sending" && <span>Sending…</span>}<time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>{isOwn && message.status !== "failed" && <span className="message-ticks">{message.read ? <CheckCheck size={12} /> : <Check size={12} />}</span>}</div>
                           </div>
                           {isOwn && message.status === "failed" && <button className="message-retry" type="button" onClick={() => retryMessage(message)}>Failed to send · Retry</button>}
@@ -1061,23 +1273,150 @@ export function ChatDashboard() {
             <div className="composer-wrap">
               {reply && <div className="reply-banner"><span>Replying to {reply.sender_id === profile?.id ? "yourself" : activeChat.person.display_name}: {reply.deleted_at ? "Message deleted" : reply.body ?? "Attachment"}</span><button aria-label="Cancel reply" onClick={() => setReply(null)}><X size={14} /></button></div>}
               <form className="composer" onSubmit={(event) => void sendMessage(event)}>
-                <div className="composer-tools">
-                  <button className="composer-tool" type="button" title="Add emoji" onClick={() => setEmojiOpen((value) => !value)}><Smile size={17} /></button>
-                  <button className="composer-tool" type="button" title="Attach image or file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button>
-                  <input ref={fileInputRef} hidden type="file" accept="image/*,.pdf,.txt,.docx" onChange={(event) => void handleFileChange(event)} />
-                </div>
-                <textarea value={draft} onChange={(event) => updateTyping(event.target.value)} onKeyDown={handleComposerKeyDown} enterKeyHint="send" placeholder="Write a message..." rows={1} aria-label="Message" />
-                {draft.trim() ? <button className="send-button" type="submit" title="Send message" disabled={sending}><Send size={16} /></button> : <button className={`composer-tool record-button ${recording ? "recording" : ""}`} type="button" title={recording ? `Stop recording (${recordSeconds}s)` : "Record voice note"} onClick={() => recording ? stopRecording() : void startRecording()}>{recording ? <Square size={15} /> : <Mic size={17} />}</button>}
+                {recording ? (
+                  <div className="voice-capture-controls">
+                    <button className="composer-tool" type="button" title="Cancel recording" onClick={cancelRecording}><X size={17} /></button>
+                    <span className="recording-indicator"><i /> Recording · {formatDuration(recordSeconds)}</span>
+                    <button className="send-button" type="button" title="Stop recording" onClick={stopRecording}><Square size={15} /></button>
+                  </div>
+                ) : voiceDraft && voiceDraftUrl ? (
+                  <div className="voice-capture-controls voice-preview-controls">
+                    <button className="composer-tool" type="button" title="Discard voice note" onClick={discardVoiceDraft}><X size={17} /></button>
+                    <VoiceNotePlayer src={voiceDraftUrl} duration={recordSeconds} onError={setError} />
+                    <button className="send-button" type="button" title="Send voice note" onClick={sendVoiceNote}><Send size={16} /></button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="composer-tools">
+                      <button className="composer-tool" type="button" title="Add emoji" onClick={() => setEmojiOpen((value) => !value)}><Smile size={17} /></button>
+                      <button className="composer-tool" type="button" title="Attach image or file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button>
+                      <input ref={fileInputRef} hidden type="file" accept="image/*,.pdf,.txt,.docx" onChange={(event) => void handleFileChange(event)} />
+                    </div>
+                    <textarea value={draft} onChange={(event) => updateTyping(event.target.value)} onKeyDown={handleComposerKeyDown} enterKeyHint="send" placeholder="Write a message..." rows={1} aria-label="Message" />
+                    {draft.trim() ? <button className="send-button" type="submit" title="Send message" disabled={sending}><Send size={16} /></button> : <button className="composer-tool record-button" type="button" title="Record voice note" onClick={() => void startRecording()}><Mic size={17} /></button>}
+                  </>
+                )}
               </form>
               {emojiOpen && <div className="emoji-popover"><div className="emoji-grid">{QUICK_EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => { setDraft((value) => value + emoji); setEmojiOpen(false); }}>{emoji}</button>)}</div></div>}
-              <div className="composer-caption">{recording ? `Recording voice note · ${recordSeconds}s` : "Enter to send · Shift + Enter for a new line"}<span><LockKeyhole size={10} /> Private conversation</span></div>
+              <div className="composer-caption">{recording ? "Cancel or stop to preview your voice note" : voiceDraft ? "Preview your voice note before sending" : "Enter to send · Shift + Enter for a new line"}<span><LockKeyhole size={10} /> Private conversation</span></div>
             </div>
           </>
         )}
       </section>
 
       {searchOpen && profile && <ContactSearchDialog onClose={() => setSearchOpen(false)} onContact={async (person) => { setSearchOpen(false); await openContact(person.id); }} onRequestSent={async () => { await loadDashboard(); }} />}
+      {viewingStory && viewingStoryIndex !== null && <StoryViewer story={viewingStory} index={viewingStoryIndex} total={stories.length} onClose={() => setViewingStoryIndex(null)} onNavigate={moveStory} />}
     </main>
+  );
+}
+
+function VoiceNotePlayer({ src, duration, onError }: { src: string; duration: number; onError: (message: string) => void }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [actualDuration, setActualDuration] = useState(duration);
+
+  async function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      try {
+        await audio.play();
+        setPlaying(true);
+      } catch (caught) {
+        onError(caught instanceof Error ? caught.message : "Could not play this voice note.");
+      }
+    } else {
+      audio.pause();
+      setPlaying(false);
+    }
+  }
+
+  return (
+    <div className="voice-player">
+      <audio
+        ref={audioRef}
+        src={src}
+        preload="metadata"
+        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        onLoadedMetadata={(event) => {
+          if (Number.isFinite(event.currentTarget.duration)) setActualDuration(event.currentTarget.duration);
+        }}
+        onEnded={() => { setPlaying(false); setCurrentTime(0); }}
+        onError={() => onError("Could not load this voice note.")}
+      />
+      <button className="voice-play-button" type="button" aria-label={playing ? "Pause voice note" : "Play voice note"} onClick={() => void togglePlayback()}>
+        {playing ? <Pause size={15} /> : <Play size={15} />}
+      </button>
+      <div className="voice-player-track">
+        <input
+          aria-label="Voice note position"
+          type="range"
+          min={0}
+          max={Math.max(actualDuration, 1)}
+          step={0.1}
+          value={Math.min(currentTime, actualDuration)}
+          onChange={(event) => {
+            const audio = audioRef.current;
+            const nextTime = Number(event.target.value);
+            if (audio) audio.currentTime = nextTime;
+            setCurrentTime(nextTime);
+          }}
+        />
+        <span>{formatDuration(Math.floor(currentTime))} / {formatDuration(Math.floor(actualDuration || duration))}</span>
+      </div>
+    </div>
+  );
+}
+
+function StoryViewer({
+  story,
+  index,
+  total,
+  onClose,
+  onNavigate,
+}: {
+  story: ChatStory;
+  index: number;
+  total: number;
+  onClose: () => void;
+  onNavigate: (direction: -1 | 1) => void;
+}) {
+  useEffect(() => {
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft") onNavigate(-1);
+      if (event.key === "ArrowRight") onNavigate(1);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, onNavigate]);
+
+  return (
+    <div className="story-viewer-backdrop" role="dialog" aria-modal="true" aria-label={`${story.person.display_name}'s story`} onClick={onClose}>
+      <div className="story-viewer" onClick={(event) => event.stopPropagation()}>
+        <div className="story-progress-list">
+          {Array.from({ length: total }, (_, progressIndex) => (
+            <span className="story-progress" key={progressIndex}>
+              <i
+                className={progressIndex < index ? "complete" : progressIndex === index ? "current" : ""}
+                key={`${index}-${progressIndex}`}
+              />
+            </span>
+          ))}
+        </div>
+        <div className="story-viewer-head">
+          <div className="story-viewer-person"><Avatar name={story.person.display_name} url={story.person.avatar_url} /><span><strong>{story.person.display_name}</strong><small>{timeLabel(story.created_at)}</small></span></div>
+          <button type="button" className="icon-button" aria-label="Close story" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="story-viewer-content">
+          {story.signedUrl ? <img src={story.signedUrl} alt={`Story from ${story.person.display_name}`} /> : <p>{story.content}</p>}
+          {story.signedUrl && story.content && <div className="story-viewer-caption">{story.content}</div>}
+        </div>
+        <button type="button" className="story-nav-hit left" aria-label="Previous story" onClick={() => onNavigate(-1)}><ChevronLeft size={22} /></button>
+        <button type="button" className="story-nav-hit right" aria-label="Next story" onClick={() => onNavigate(1)}><ChevronRight size={22} /></button>
+      </div>
+    </div>
   );
 }
 

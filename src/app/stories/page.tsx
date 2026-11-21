@@ -7,6 +7,7 @@ import { SubpageNav } from "@/components/subpage-nav";
 import { Avatar } from "@/components/ui/avatar";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import type { Profile, Story } from "@/lib/database.types";
+import { compressImage } from "@/lib/compress-image";
 
 type StoryView = Story & { person: Profile & Record<string, unknown>; signedUrl: string | null; remainingMs: number };
 
@@ -105,8 +106,8 @@ export default function StoriesPage() {
       setError("Stories currently support image files only.");
       return;
     }
-    if (selected.size > 10 * 1024 * 1024) {
-      setError("Story images must be 10 MB or smaller.");
+    if (selected.size > 25 * 1024 * 1024) {
+      setError("Choose an image smaller than 25 MB so it can be compressed for upload.");
       return;
     }
     setError("");
@@ -124,8 +125,21 @@ export default function StoriesPage() {
     setError("");
     let mediaPath: string | null = null;
     if (file) {
-      mediaPath = `${userId}/${crypto.randomUUID()}-${file.name.replace(/[^A-Za-z0-9._-]/g, "_").slice(-80)}`;
-      const { error: uploadError } = await supabase.storage.from("story-media").upload(mediaPath, file, { contentType: file.type, upsert: false });
+      let compressedFile: File;
+      try {
+        compressedFile = await compressImage(file);
+      } catch (caught) {
+        setPosting(false);
+        setError(caught instanceof Error ? caught.message : "Could not compress the selected image.");
+        return;
+      }
+      if (compressedFile.size > 10 * 1024 * 1024) {
+        setPosting(false);
+        setError("This image is still too large after compression. Choose a smaller image.");
+        return;
+      }
+      mediaPath = `${userId}/${crypto.randomUUID()}-${compressedFile.name.replace(/[^A-Za-z0-9._-]/g, "_").slice(-80)}`;
+      const { error: uploadError } = await supabase.storage.from("story-media").upload(mediaPath, compressedFile, { contentType: compressedFile.type, upsert: false });
       if (uploadError) {
         setPosting(false);
         setError(uploadError.message);

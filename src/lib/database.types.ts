@@ -51,6 +51,7 @@ export interface Message {
   type: "text" | "image" | "document" | "voice";
   body: string | null;
   media_path: string | null;
+  duration_seconds: number | null;
   created_at: string;
   edited_at: string | null;
   deleted_at: string | null;
@@ -85,7 +86,7 @@ export interface Database {
       contacts: Table<Contact, Pick<Contact, "user_id" | "contact_id">>;
       conversations: Table<Conversation>;
       conversation_members: Table<ConversationMember>;
-      messages: Table<Message, Pick<Message, "conversation_id" | "sender_id"> & Partial<Pick<Message, "reply_to_id" | "type" | "body" | "media_path">>>;
+      messages: Table<Message, Pick<Message, "conversation_id" | "sender_id"> & Partial<Pick<Message, "reply_to_id" | "type" | "body" | "media_path" | "duration_seconds">>>;
       message_reactions: Table<{ message_id: string; user_id: string; emoji: string; created_at: string }, Pick<{ message_id: string; user_id: string; emoji: string }, "message_id" | "user_id" | "emoji">>;
       message_receipts: Table<{ message_id: string; user_id: string; delivered_at: string | null; read_at: string | null }>;
       streaks: Table<Streak>;
