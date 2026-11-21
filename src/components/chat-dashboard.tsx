@@ -27,12 +27,41 @@ type MessageView = Message & {
   mediaUrl: string | null;
   reactions: Array<{ emoji: string; user_id: string }>;
   read: boolean;
+  status?: "sending" | "sent" | "failed";
 };
 
 const QUICK_EMOJIS = ["😀", "😂", "🥹", "😍", "🔥", "💜", "👏", "✨", "👍", "❤️", "🎉", "🙏"];
 
 function initials(name: string) {
   return name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("") || "Z";
+}
+
+function isMessage(value: unknown): value is Message {
+  if (typeof value !== "object" || value === null) return false;
+  return "id" in value
+    && typeof value.id === "string"
+    && "client_id" in value
+    && (value.client_id === null || typeof value.client_id === "string")
+    && "conversation_id" in value
+    && typeof value.conversation_id === "string"
+    && "sender_id" in value
+    && typeof value.sender_id === "string"
+    && "reply_to_id" in value
+    && (value.reply_to_id === null || typeof value.reply_to_id === "string")
+    && "type" in value
+    && (value.type === "text" || value.type === "image" || value.type === "document" || value.type === "voice")
+    && "body" in value
+    && (value.body === null || typeof value.body === "string")
+    && "media_path" in value
+    && (value.media_path === null || typeof value.media_path === "string")
+    && "created_at" in value
+    && typeof value.created_at === "string"
+    && "edited_at" in value
+    && (value.edited_at === null || typeof value.edited_at === "string")
+    && "deleted_at" in value
+    && (value.deleted_at === null || typeof value.deleted_at === "string")
+    && "expires_at" in value
+    && (value.expires_at === null || typeof value.expires_at === "string");
 }
 
 function timeLabel(value: string) {
@@ -52,6 +81,32 @@ function streakState(streak: Streak | null) {
   };
 }
 
+function sortMessages(messages: MessageView[]) {
+  return messages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+}
+
+function upsertMessageList(messages: MessageView[], incoming: MessageView) {
+  const index = messages.findIndex((message) =>
+    message.id === incoming.id
+    || (incoming.client_id !== null && message.client_id === incoming.client_id),
+  );
+  const next = [...messages];
+  if (index === -1) {
+    next.push(incoming);
+  } else {
+    const existing = next[index];
+    next[index] = {
+      ...existing,
+      ...incoming,
+      mediaUrl: incoming.mediaUrl ?? existing.mediaUrl,
+      reactions: incoming.reactions.length ? incoming.reactions : existing.reactions,
+      read: incoming.read || existing.read,
+      status: incoming.status ?? existing.status,
+    };
+  }
+  return sortMessages(next);
+}
+
 export function ChatDashboard() {
   const router = useRouter();
   const supabase = getSupabaseBrowserClient();
@@ -65,6 +120,7 @@ export function ChatDashboard() {
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("");
   const [listMode, setListMode] = useState<"chats" | "requests">("chats");
+  const [realtimeRetry, setRealtimeRetry] = useState(0);
   const [searchOpen, setSearchOpen] = useState(false);
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const [draft, setDraft] = useState("");
@@ -79,11 +135,22 @@ export function ChatDashboard() {
   const [recordSeconds, setRecordSeconds] = useState(0);
   const channelRef = useRef<RealtimeChannel | null>(null);
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunks = useRef<Blob[]>([]);
   const recordTimer = useRef<number | null>(null);
   const feedRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const activeIdRef = useRef(activeId);
+  const mobileChatOpenRef = useRef(mobileChatOpen);
+  const messagesCacheRef = useRef(new Map<string, MessageView[]>());
+  const pendingSendsRef = useRef(new Set<string>());
+
+  const selectConversation = useCallback((conversationId: string) => {
+    activeIdRef.current = conversationId;
+    setActiveId(conversationId);
+    setMessages(messagesCacheRef.current.get(conversationId) ?? []);
+  }, []);
 
   const activeChat = chats.find((chat) => chat.conversation.id === activeId) ?? null;
   const activePersonId = activeChat?.person.id;
@@ -95,38 +162,116 @@ export function ChatDashboard() {
     return chats.filter((chat) => !query || chat.person.display_name.toLowerCase().includes(query) || chat.person.username.toLowerCase().includes(query));
   }, [chats, filter]);
 
+  const updateConversationPreview = useCallback((message: Message) => {
+    setChats((current) => {
+      let foundConversation = false;
+      const updated = current.map((chat) => {
+        if (chat.conversation.id !== message.conversation_id) return chat;
+        foundConversation = true;
+        const previous = chat.lastMessage;
+        const isDuplicate = previous?.id === message.id
+          || (message.client_id !== null && previous?.client_id === message.client_id);
+        if (previous && !isDuplicate && new Date(previous.created_at) > new Date(message.created_at)) return chat;
+        const isVisibleActiveChat = activeIdRef.current === message.conversation_id
+          && document.visibilityState === "visible"
+          && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpenRef.current);
+        return {
+          ...chat,
+          lastMessage: message,
+          unread: !isDuplicate && message.sender_id !== currentUserId && !isVisibleActiveChat
+            ? chat.unread + 1
+            : chat.unread,
+        };
+      });
+      if (!foundConversation) return current;
+      return updated.sort((a, b) => new Date(b.lastMessage?.created_at ?? b.conversation.created_at).getTime() - new Date(a.lastMessage?.created_at ?? a.conversation.created_at).getTime());
+    });
+  }, [currentUserId]);
+
+  const scheduleRealtimeReconnect = useCallback(() => {
+    if (reconnectTimerRef.current !== null) return;
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      setRealtimeRetry((current) => current + 1);
+    }, 1500);
+  }, []);
+
+  useEffect(() => () => {
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+  }, []);
+
+  const upsertMessage = useCallback((message: MessageView) => {
+    const cached = messagesCacheRef.current.get(message.conversation_id) ?? [];
+    messagesCacheRef.current.set(message.conversation_id, upsertMessageList(cached, message));
+    if (activeIdRef.current === message.conversation_id) {
+      setMessages((current) => upsertMessageList(current, message));
+    }
+  }, []);
+
+  const patchMessage = useCallback((
+    conversationId: string,
+    messageId: string,
+    patch: Partial<MessageView> | ((message: MessageView) => Partial<MessageView>),
+  ) => {
+    const patchList = (current: MessageView[]) => current.map((message) =>
+      message.id === messageId
+        ? { ...message, ...(typeof patch === "function" ? patch(message) : patch) }
+        : message,
+    );
+    messagesCacheRef.current.set(conversationId, patchList(messagesCacheRef.current.get(conversationId) ?? []));
+    if (activeIdRef.current === conversationId) setMessages(patchList);
+  }, []);
+
   const loadMessages = useCallback(async (conversationId: string) => {
     if (!supabase) return;
     const { data: rows, error: messageError } = await supabase
       .from("messages")
       .select("*")
       .eq("conversation_id", conversationId)
-      .order("created_at", { ascending: true })
-      .limit(100);
+      .order("created_at", { ascending: false })
+      .limit(50);
     if (messageError) throw messageError;
-    const messageRows = rows ?? [];
+    const messageRows = (rows ?? []).reverse();
     const ids = messageRows.map((message) => message.id);
-    const mediaRows = await Promise.all(messageRows.map(async (message) => {
-      if (!message.media_path) return [message.id, null] as const;
-      const { data, error: signedUrlError } = await supabase.storage.from("chat-media").createSignedUrl(message.media_path, 60 * 15);
-      if (signedUrlError) throw signedUrlError;
-      return [message.id, data?.signedUrl ?? null] as const;
-    }));
-    const mediaUrls = new Map(mediaRows);
-    const [reactionResult, receiptResult] = ids.length ? await Promise.all([
-      supabase.from("message_reactions").select("message_id,user_id,emoji").in("message_id", ids),
-      supabase.from("message_receipts").select("message_id,user_id,read_at").in("message_id", ids),
-    ]) : [{ data: [], error: null }, { data: [], error: null }];
+    const [mediaRows, reactionResult, receiptResult] = await Promise.all([
+      Promise.all(messageRows.map(async (message) => {
+        if (!message.media_path) return [message.id, null] as const;
+        const { data, error: signedUrlError } = await supabase.storage.from("chat-media").createSignedUrl(message.media_path, 60 * 15);
+        if (signedUrlError) throw signedUrlError;
+        return [message.id, data?.signedUrl ?? null] as const;
+      })),
+      ids.length
+        ? supabase.from("message_reactions").select("message_id,user_id,emoji").in("message_id", ids)
+        : Promise.resolve({ data: [], error: null }),
+      ids.length
+        ? supabase.from("message_receipts").select("message_id,user_id,read_at").in("message_id", ids)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
     if (reactionResult.error) throw reactionResult.error;
     if (receiptResult.error) throw receiptResult.error;
+    const mediaUrls = new Map(mediaRows);
     const ownMessageIds = new Set(messageRows.filter((message) => message.sender_id === profile?.id).map((message) => message.id));
     const loaded: MessageView[] = messageRows.map((message) => ({
       ...message,
       mediaUrl: mediaUrls.get(message.id) ?? null,
       reactions: (reactionResult.data ?? []).filter((reaction) => reaction.message_id === message.id),
       read: (receiptResult.data ?? []).some((receipt) => receipt.user_id !== profile?.id && ownMessageIds.has(message.id) && Boolean(receipt.read_at)),
+      status: "sent",
     }));
-    setMessages(loaded);
+    const cached = messagesCacheRef.current.get(conversationId) ?? [];
+    let merged = [...loaded];
+    const oldestLoadedAt = loaded[0]?.created_at;
+    for (const existing of cached) {
+      if (existing.status === "sending" || existing.status === "failed"
+        || (oldestLoadedAt && existing.created_at >= oldestLoadedAt)) {
+        merged = upsertMessageList(merged, existing);
+      }
+    }
+    const pendingMessages = merged.filter((message) => message.status === "sending" || message.status === "failed");
+    const recentMessages = merged.filter((message) => message.status !== "sending" && message.status !== "failed").slice(-50);
+    const synced = sortMessages([...recentMessages, ...pendingMessages]);
+    messagesCacheRef.current.set(conversationId, synced);
+    if (activeIdRef.current === conversationId) setMessages(synced);
   }, [profile?.id, supabase]);
 
   const refreshMessages = useCallback(async (conversationId: string) => {
@@ -139,8 +284,8 @@ export function ChatDashboard() {
 
   const isChatVisible = useCallback(() => (
     document.visibilityState === "visible"
-    && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpen)
-  ), [mobileChatOpen]);
+    && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpenRef.current)
+  ), []);
 
   const markConversationRead = useCallback(async (conversationId: string) => {
     if (!supabase) return;
@@ -155,7 +300,7 @@ export function ChatDashboard() {
     ));
   }, [supabase]);
 
-  const loadDashboard = useCallback(async (keepSelection = true) => {
+  const loadDashboard = useCallback(async () => {
     if (!supabase) {
       setLoading(false);
       setError("Supabase isn’t configured. Add the values in .env.local to connect your account.");
@@ -276,20 +421,30 @@ export function ChatDashboard() {
       return person ? [{ contact, person }] : [];
     }));
 
-    if (keepSelection && activeId && chatsLoaded.some((chat) => chat.conversation.id === activeId)) {
-      setActiveId(activeId);
-    } else if (chatsLoaded.length && !activeId) {
-      setActiveId(chatsLoaded[0].conversation.id);
-    } else if (activeId && !chatsLoaded.some((chat) => chat.conversation.id === activeId)) {
-      setActiveId("");
+    const selectedConversationId = activeIdRef.current;
+    if (chatsLoaded.length && !selectedConversationId) {
+      selectConversation(chatsLoaded[0].conversation.id);
+    } else if (selectedConversationId && !chatsLoaded.some((chat) => chat.conversation.id === selectedConversationId)) {
+      selectConversation("");
     }
     setLoading(false);
-  }, [activeId, router, supabase]);
+  }, [router, selectConversation, supabase]);
 
   const loadDashboardRef = useRef(loadDashboard);
   useEffect(() => {
     loadDashboardRef.current = loadDashboard;
   }, [loadDashboard]);
+
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  const recoverRealtime = useCallback((message: string) => {
+    setError(message);
+    void loadDashboardRef.current();
+    if (activeIdRef.current) void refreshMessages(activeIdRef.current);
+    scheduleRealtimeReconnect();
+  }, [refreshMessages, scheduleRealtimeReconnect]);
 
   useEffect(() => {
     void loadDashboard();
@@ -301,22 +456,57 @@ export function ChatDashboard() {
     const reloadDashboard = () => {
       void loadDashboardRef.current();
     };
+    const applyRealtimeMessage = (row: unknown) => {
+      if (!isMessage(row)) {
+        setError("Received an invalid realtime message event.");
+        return;
+      }
+      const message = row;
+      upsertMessage({ ...message, mediaUrl: null, reactions: [], read: false, status: "sent" });
+      updateConversationPreview(message);
+      if (message.sender_id !== currentUserId && activeIdRef.current === message.conversation_id
+        && document.visibilityState === "visible"
+        && (!window.matchMedia("(max-width: 700px)").matches || mobileChatOpenRef.current)) {
+        void markConversationRead(message.conversation_id);
+      }
+    };
     const channel = supabase
       .channel(`ziza:account:${currentUserId}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "conversations" }, reloadDashboard)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: `user_id=eq.${currentUserId}` }, reloadDashboard)
       .on("postgres_changes", { event: "*", schema: "public", table: "contacts", filter: `user_id=eq.${currentUserId}` }, reloadDashboard)
       .on("postgres_changes", { event: "*", schema: "public", table: "contacts", filter: `contact_id=eq.${currentUserId}` }, reloadDashboard)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, ({ new: row }) => {
+        applyRealtimeMessage(row);
+      })
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages" }, ({ new: row }) => {
+        applyRealtimeMessage(row);
+      })
+      .on("postgres_changes", { event: "DELETE", schema: "public", table: "messages" }, ({ old: row }) => {
+        if (!isMessage(row)) {
+          setError("Received an invalid realtime message event.");
+          return;
+        }
+        const remaining = (messagesCacheRef.current.get(row.conversation_id) ?? [])
+          .filter((message) => message.id !== row.id);
+        messagesCacheRef.current.set(row.conversation_id, remaining);
+        if (activeIdRef.current === row.conversation_id) setMessages(remaining);
+      })
       .subscribe((status) => {
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setError("Live chat updates are unavailable. Check your Supabase Realtime configuration.");
+          recoverRealtime("Live chat updates are unavailable. Check your Supabase Realtime configuration.");
         }
       });
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") reloadDashboard();
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       void supabase.removeChannel(channel);
     };
-  }, [currentUserId, supabase]);
+  }, [currentUserId, markConversationRead, realtimeRetry, recoverRealtime, supabase, updateConversationPreview, upsertMessage]);
 
   useEffect(() => {
     if (!activeId || !currentUserId || currentUserHidesOnline === undefined || !supabase) {
@@ -328,14 +518,6 @@ export function ChatDashboard() {
 
     const channel = supabase
       .channel(`ziza:conversation:${activeId}`, { config: { private: true, presence: { key: currentUserId } } })
-      .on("postgres_changes", { event: "*", schema: "public", table: "messages", filter: `conversation_id=eq.${activeId}` }, () => {
-        void refreshMessages(activeId);
-        void loadDashboardRef.current();
-        if (isChatVisible()) void markConversationRead(activeId);
-      })
-      .on("postgres_changes", { event: "*", schema: "public", table: "conversations", filter: `id=eq.${activeId}` }, () => {
-        void loadDashboardRef.current();
-      })
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         const senderId = typeof payload?.user_id === "string" ? payload.user_id : "";
         if (senderId !== currentUserId) setTyping(Boolean(payload?.is_typing));
@@ -348,19 +530,28 @@ export function ChatDashboard() {
         if (status === "SUBSCRIBED" && !currentUserHidesOnline) {
           void channel.track({ user_id: currentUserId, online_at: new Date().toISOString() });
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setError("Live conversation updates are unavailable. Check your Supabase Realtime configuration.");
+          recoverRealtime("Live conversation updates are unavailable. Check your Supabase Realtime configuration.");
         }
       });
     channelRef.current = channel;
 
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+      void refreshMessages(activeId);
+      if (isChatVisible()) void markConversationRead(activeId);
+      scheduleRealtimeReconnect();
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
     return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (typingTimer.current) clearTimeout(typingTimer.current);
       void supabase.removeChannel(channel);
       if (channelRef.current === channel) channelRef.current = null;
       setTyping(false);
       setOnline(false);
     };
-  }, [activeId, activePersonId, activePersonHidden, currentUserHidesOnline, currentUserId, isChatVisible, markConversationRead, refreshMessages, supabase]);
+  }, [activeId, activePersonId, activePersonHidden, currentUserHidesOnline, currentUserId, isChatVisible, markConversationRead, realtimeRetry, recoverRealtime, refreshMessages, scheduleRealtimeReconnect, supabase]);
 
   useEffect(() => {
     feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight, behavior: "smooth" });
@@ -377,7 +568,8 @@ export function ChatDashboard() {
     if (!supabase) return;
     const currentChat = chats.find((chat) => chat.person.id === personId);
     if (currentChat) {
-      setActiveId(currentChat.conversation.id);
+      selectConversation(currentChat.conversation.id);
+      mobileChatOpenRef.current = true;
       setMobileChatOpen(true);
       return;
     }
@@ -386,8 +578,9 @@ export function ChatDashboard() {
       setError(conversationError.message);
       return;
     }
-    await loadDashboard(false);
-    setActiveId(data);
+    await loadDashboard();
+    selectConversation(data);
+    mobileChatOpenRef.current = true;
     setMobileChatOpen(true);
   }
 
@@ -398,36 +591,115 @@ export function ChatDashboard() {
       setError(responseError.message);
       return;
     }
-    await loadDashboard(false);
-    if (accept) {
-      const { data: person } = await supabase.from("profiles").select("id").eq("id", contact.user_id).single();
-      if (person) await openContact(person.id);
+    await loadDashboard();
+    if (accept) await openContact(contact.user_id);
+  }
+
+  async function persistMessage(message: MessageView) {
+    if (!supabase || !message.client_id || pendingSendsRef.current.has(message.client_id)) return;
+    pendingSendsRef.current.add(message.client_id);
+    upsertMessage({ ...message, status: "sending" });
+    try {
+      const { data, error: insertError } = await supabase.from("messages").insert({
+        client_id: message.client_id,
+        conversation_id: message.conversation_id,
+        sender_id: message.sender_id,
+        reply_to_id: message.reply_to_id,
+        type: message.type,
+        body: message.body,
+        media_path: message.media_path,
+      }).select("*").single();
+      let savedMessage = data;
+      if (insertError) {
+        const { data: existingMessage, error: lookupError } = await supabase
+          .from("messages")
+          .select("*")
+          .eq("sender_id", message.sender_id)
+          .eq("client_id", message.client_id)
+          .maybeSingle();
+        if (lookupError) {
+          upsertMessage({ ...message, status: "failed" });
+          setError(`${insertError.message} Also, checking whether the message was saved failed: ${lookupError.message}`);
+          return;
+        }
+        if (!existingMessage) {
+          upsertMessage({ ...message, status: "failed" });
+          setError(insertError.message);
+          return;
+        }
+        savedMessage = existingMessage;
+      }
+      if (!savedMessage) {
+        upsertMessage({ ...message, status: "failed" });
+        setError("The message insert returned no row.");
+        return;
+      }
+      const confirmed: MessageView = {
+        ...savedMessage,
+        mediaUrl: null,
+        reactions: [],
+        read: false,
+        status: "sent",
+      };
+      upsertMessage(confirmed);
+      updateConversationPreview(confirmed);
+      if (confirmed.media_path) {
+        try {
+          const { data: signedUrl, error: signedUrlError } = await supabase.storage
+            .from("chat-media")
+            .createSignedUrl(confirmed.media_path, 60 * 15);
+          if (signedUrlError) {
+            setError(signedUrlError.message);
+          } else if (signedUrl) {
+            upsertMessage({ ...confirmed, mediaUrl: signedUrl.signedUrl });
+          }
+        } catch (caught) {
+          setError(caught instanceof Error ? caught.message : "Could not load the attachment.");
+        }
+      }
+    } catch (caught) {
+      upsertMessage({ ...message, status: "failed" });
+      setError(caught instanceof Error ? caught.message : "Could not send the message.");
+    } finally {
+      pendingSendsRef.current.delete(message.client_id);
     }
   }
 
   async function sendMessage(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
-    if (!supabase || !profile || !activeChat || !draft.trim() || sending) return;
+    if (!supabase || !profile || !activeChat || !draft.trim()) return;
     const body = draft.trim();
     const replyToId = reply?.id ?? null;
-    setDraft("");
-    setReply(null);
-    setSending(true);
-    const { error: insertError } = await supabase.from("messages").insert({
+    const clientId = crypto.randomUUID();
+    const optimistic: MessageView = {
+      id: clientId,
+      client_id: clientId,
       conversation_id: activeChat.conversation.id,
       sender_id: profile.id,
       reply_to_id: replyToId,
       type: "text",
       body,
-    });
-    setSending(false);
-    if (insertError) {
-      setDraft(body);
-      setError(insertError.message);
-      return;
-    }
-    void refreshMessages(activeChat.conversation.id);
-    void loadDashboard();
+      media_path: null,
+      created_at: new Date().toISOString(),
+      edited_at: null,
+      deleted_at: null,
+      expires_at: null,
+      mediaUrl: null,
+      reactions: [],
+      read: false,
+      status: "sending",
+    };
+    setDraft("");
+    setReply(null);
+    setError("");
+    upsertMessage(optimistic);
+    updateConversationPreview(optimistic);
+    void persistMessage(optimistic);
+  }
+
+  function retryMessage(message: MessageView) {
+    setError("");
+    void persistMessage(message);
   }
 
   async function sendFile(file: File, type: "image" | "document" | "voice") {
@@ -442,20 +714,29 @@ export function ChatDashboard() {
       setError(uploadError.message);
       return;
     }
-    const { error: messageError } = await supabase.from("messages").insert({
+    const clientId = crypto.randomUUID();
+    const optimistic: MessageView = {
+      id: clientId,
+      client_id: clientId,
       conversation_id: activeChat.conversation.id,
       sender_id: profile.id,
+      reply_to_id: null,
       type,
-      media_path: path,
       body: null,
-    });
+      media_path: path,
+      created_at: new Date().toISOString(),
+      edited_at: null,
+      deleted_at: null,
+      expires_at: null,
+      mediaUrl: null,
+      reactions: [],
+      read: false,
+      status: "sending",
+    };
+    upsertMessage(optimistic);
+    updateConversationPreview(optimistic);
+    await persistMessage(optimistic);
     setSending(false);
-    if (messageError) {
-      setError(`Upload succeeded but the message could not be sent: ${messageError.message}`);
-      return;
-    }
-    void refreshMessages(activeChat.conversation.id);
-    void loadDashboard();
   }
 
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -540,16 +821,23 @@ export function ChatDashboard() {
       ? await supabase.from("message_reactions").delete().eq("message_id", message.id).eq("user_id", profile.id).eq("emoji", emoji)
       : await supabase.from("message_reactions").insert({ message_id: message.id, user_id: profile.id, emoji });
     if (result.error) setError(result.error.message);
-    else if (activeId) void refreshMessages(activeId);
+    else if (activeId) {
+      patchMessage(activeId, message.id, (current) => ({
+        reactions: existing
+          ? current.reactions.filter((reaction) => reaction.emoji !== emoji || reaction.user_id !== profile.id)
+          : [...current.reactions, { emoji, user_id: profile.id }],
+      }));
+    }
   }
 
   async function saveEdit(messageId: string) {
     if (!supabase || !editDraft.trim()) return;
-    const { error: editError } = await supabase.from("messages").update({ body: editDraft.trim() }).eq("id", messageId);
+    const body = editDraft.trim();
+    const { error: editError } = await supabase.from("messages").update({ body }).eq("id", messageId);
     if (editError) setError(editError.message);
     else {
       setEditingId("");
-      if (activeId) void refreshMessages(activeId);
+      if (activeId) patchMessage(activeId, messageId, { body, edited_at: new Date().toISOString() });
     }
   }
 
@@ -557,7 +845,7 @@ export function ChatDashboard() {
     if (!supabase || !window.confirm("Delete this message for everyone?")) return;
     const { error: deleteError } = await supabase.from("messages").update({ deleted_at: new Date().toISOString() }).eq("id", messageId);
     if (deleteError) setError(deleteError.message);
-    else     if (activeId) void refreshMessages(activeId);
+    else if (activeId) patchMessage(activeId, messageId, { deleted_at: new Date().toISOString() });
   }
 
   async function blockActivePerson() {
@@ -565,9 +853,10 @@ export function ChatDashboard() {
     const { error: blockError } = await supabase.rpc("block_user", { p_user_id: activeChat.person.id });
     if (blockError) setError(blockError.message);
     else {
-      setActiveId("");
+      selectConversation("");
+      mobileChatOpenRef.current = false;
       setMobileChatOpen(false);
-      await loadDashboard(false);
+      await loadDashboard();
     }
   }
 
@@ -629,7 +918,7 @@ export function ChatDashboard() {
               {loading ? <div className="loading-screen"><span><span className="button-spinner" /> Loading your chats</span></div> : filteredChats.length ? filteredChats.map((chat) => {
                 const streak = streakState(chat.streak);
                 return (
-                  <button className={`chat-row ${activeId === chat.conversation.id ? "active" : ""}`} key={chat.conversation.id} onClick={() => { setActiveId(chat.conversation.id); setMobileChatOpen(true); }}>
+                  <button className={`chat-row ${activeId === chat.conversation.id ? "active" : ""}`} key={chat.conversation.id} onClick={() => { selectConversation(chat.conversation.id); mobileChatOpenRef.current = true; setMobileChatOpen(true); }}>
                     <Avatar name={chat.person.display_name} url={chat.person.avatar_url} />
                     <span className="chat-row-main">
                       <span className="chat-row-line"><strong>{chat.person.display_name}</strong><time>{chat.lastMessage ? timeLabel(chat.lastMessage.created_at) : timeLabel(chat.conversation.created_at)}</time></span>
@@ -685,7 +974,7 @@ export function ChatDashboard() {
         ) : (
           <>
             <header className="chat-topbar">
-              <button className="icon-button back-to-list" aria-label="Back to chats" onClick={() => setMobileChatOpen(false)}><ArrowLeft size={18} /></button>
+              <button className="icon-button back-to-list" aria-label="Back to chats" onClick={() => { mobileChatOpenRef.current = false; setMobileChatOpen(false); }}><ArrowLeft size={18} /></button>
               <div className="chat-person">
                 <Avatar name={activeChat.person.display_name} url={activeChat.person.avatar_url} />
                 <div className="chat-person-copy"><strong>{activeChat.person.display_name}</strong><span>{typing ? <><i className="online-dot" /> Typing…</> : activeChat.person.hide_online_status ? "Status hidden" : online ? <><i className="online-dot" /> Online</> : "Offline"} <span className="number-separator">·</span> {formatZizaNumber(activeChat.person.ziza_number)}</span></div>
@@ -705,7 +994,7 @@ export function ChatDashboard() {
                 const previous = messages[index - 1];
                 const showDate = !previous || new Date(previous.created_at).toDateString() !== new Date(message.created_at).toDateString();
                 return (
-                  <div key={message.id} className={`message-line ${isOwn ? "own" : "other"}`}>
+                  <div key={message.client_id ? `${message.sender_id}:${message.client_id}` : message.id} className={`message-line ${isOwn ? "own" : "other"}`}>
                     {!isOwn && <Avatar name={activeChat.person.display_name} url={activeChat.person.avatar_url} />}
                     <div className="message-content">
                       {showDate && <div className="feed-date">{new Date(message.created_at).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })}</div>}
@@ -720,13 +1009,14 @@ export function ChatDashboard() {
                           <div className={`message-bubble ${message.deleted_at ? "deleted" : ""}`}>
                             {replyMessage && !message.deleted_at && <div className="reply-quote"><b>{replyMessage.sender_id === profile?.id ? "You" : activeChat.person.display_name}</b>{replyMessage.deleted_at ? "Message deleted" : replyMessage.body ?? "Attachment"}</div>}
                             {message.deleted_at ? <p className="message-body">This message was deleted</p> : message.type === "image" && message.mediaUrl ? <a href={message.mediaUrl} target="_blank" rel="noreferrer"><img className="message-image" src={message.mediaUrl} alt="Shared image" /></a> : message.type === "voice" && message.mediaUrl ? <audio className="message-audio" controls src={message.mediaUrl} /> : message.type === "document" && message.mediaUrl ? <a className="message-file" href={message.mediaUrl} target="_blank" rel="noreferrer" download><FileText size={17} /> Download attachment <ArrowDown size={13} /></a> : <p className="message-body">{message.body}</p>}
-                            <div className="message-meta">{message.edited_at && !message.deleted_at && <span className="edited-label">edited</span>}<time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>{isOwn && <span className="message-ticks">{message.read ? <CheckCheck size={12} /> : <Check size={12} />}</span>}</div>
+                            <div className="message-meta">{message.edited_at && !message.deleted_at && <span className="edited-label">edited</span>}{isOwn && message.status === "sending" && <span>Sending…</span>}<time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>{isOwn && message.status !== "failed" && <span className="message-ticks">{message.read ? <CheckCheck size={12} /> : <Check size={12} />}</span>}</div>
                           </div>
+                          {isOwn && message.status === "failed" && <button className="message-retry" type="button" onClick={() => retryMessage(message)}>Failed to send · Retry</button>}
                           {message.reactions.length > 0 && <div className="reaction-row">{Array.from(new Set(message.reactions.map((reaction) => reaction.emoji))).map((emoji) => <button className="reaction-chip" key={emoji} onClick={() => void toggleReaction(message, emoji)}>{emoji} {message.reactions.filter((reaction) => reaction.emoji === emoji).length}</button>)}</div>}
                         </>
                       )}
                     </div>
-                    {!message.deleted_at && <div className="message-actions">
+                    {!message.deleted_at && message.status !== "sending" && message.status !== "failed" && <div className="message-actions">
                       <button title="Reply" onClick={() => setReply(message)}><MessageCircle size={13} /></button>
                       <button title="React" onClick={() => void toggleReaction(message, "💜")}><Smile size={13} /></button>
                       {isOwn && <button title="Edit message" onClick={() => { setEditingId(message.id); setEditDraft(message.body ?? ""); }}><Sticker size={13} /></button>}
@@ -756,7 +1046,7 @@ export function ChatDashboard() {
         )}
       </section>
 
-      {searchOpen && profile && <ContactSearchDialog onClose={() => setSearchOpen(false)} onContact={async (person) => { setSearchOpen(false); await openContact(person.id); }} onRequestSent={async () => { await loadDashboard(false); }} />}
+      {searchOpen && profile && <ContactSearchDialog onClose={() => setSearchOpen(false)} onContact={async (person) => { setSearchOpen(false); await openContact(person.id); }} onRequestSent={async () => { await loadDashboard(); }} />}
     </main>
   );
 }
