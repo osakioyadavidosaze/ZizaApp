@@ -1,4 +1,4 @@
-# Ziza App
+Ziza# Ziza App
 
 Ziza is a private-number messenger built with Next.js, TypeScript, and Supabase. This workspace includes the frontend, username-only Auth adapter, and Supabase migrations.
 

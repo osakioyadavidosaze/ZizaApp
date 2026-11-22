@@ -1,8 +1,9 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import type { Session } from "@supabase/supabase-js";
 import { QRCodeSVG } from "qrcode.react";
 import { ArrowRight, Check, Copy, LockKeyhole, MessageCircle, QrCode, ShieldCheck, Sparkles } from "lucide-react";
 import { authAliasForUsername, formatZizaNumber, getSupabaseConfigError, normalizeZizaNumber, usernameSchema } from "@/lib/auth";
@@ -22,8 +23,52 @@ export function AuthScreen() {
   const [busy, setBusy] = useState(false);
   const [newProfile, setNewProfile] = useState<Profile | null>(null);
   const [copied, setCopied] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [authRedirecting, setAuthRedirecting] = useState(false);
 
   const configError = getSupabaseConfigError();
+
+  useEffect(() => {
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setAuthReady(true);
+      return;
+    }
+
+    let active = true;
+    let initialSessionHandled = false;
+    const finishInitialization = (session: Session | null) => {
+      if (!active || initialSessionHandled) return;
+      initialSessionHandled = true;
+      if (session) {
+        setAuthRedirecting(true);
+        router.replace("/chat");
+      }
+      setAuthReady(true);
+    };
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "INITIAL_SESSION") finishInitialization(session);
+    });
+
+    void supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (!active || initialSessionHandled) return;
+      if (sessionError) {
+        setError(sessionError.message);
+        setAuthReady(true);
+        return;
+      }
+      finishInitialization(data.session);
+    }, (caught: unknown) => {
+      if (!active || initialSessionHandled) return;
+      setError(caught instanceof Error ? caught.message : "Could not check your sign-in status.");
+      setAuthReady(true);
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [router]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -84,7 +129,7 @@ export function AuthScreen() {
         const result: { error?: string } = await response.json();
         if (!response.ok) throw new Error(result.error ?? "Unable to sign in.");
         await supabase.auth.getSession();
-        router.push("/chat");
+        router.replace("/chat");
         router.refresh();
       }
     } catch (caught) {
@@ -111,6 +156,10 @@ export function AuthScreen() {
     anchor.download = `ziza-${newProfile.ziza_number}.svg`;
     anchor.click();
     URL.revokeObjectURL(url);
+  }
+
+  if (!authReady || authRedirecting) {
+    return <main className="loading-screen" role="status"><span><span className="button-spinner" /> Checking your sign-in status</span></main>;
   }
 
   return (

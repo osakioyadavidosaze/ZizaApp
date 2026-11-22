@@ -386,8 +386,25 @@ export function ChatDashboard() {
     }
 
     setError("");
+    const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+    if (sessionError) {
+      setError(sessionError.message);
+      setLoading(false);
+      return;
+    }
+    if (!sessionData.session) {
+      setLoading(false);
+      router.replace("/");
+      return;
+    }
     const { data: authData, error: authError } = await supabase.auth.getUser();
-    if (authError || !authData.user) {
+    if (authError) {
+      setError(authError.message);
+      setLoading(false);
+      return;
+    }
+    if (!authData.user) {
+      setLoading(false);
       router.replace("/");
       return;
     }

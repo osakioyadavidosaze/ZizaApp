@@ -5,6 +5,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { authAliasForUsername, normalizeZizaNumber, usernameSchema } from "@/lib/auth";
 import type { Database } from "@/lib/database.types";
+import { authCookieOptions } from "@/lib/supabase/cookie-options";
 
 const loginSchema = z.object({
   identifier: z.string().trim().min(1).max(64),
@@ -47,6 +48,7 @@ export async function POST(request: Request) {
 
   const cookieStore = await cookies();
   const supabase = createServerClient<Database>(url, anonKey, {
+    cookieOptions: authCookieOptions,
     cookies: {
       getAll: () => cookieStore.getAll(),
       setAll: (cookiesToSet) => {
